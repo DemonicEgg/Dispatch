@@ -59,6 +59,7 @@ import { SubagentFooter } from "./subagent-footer.tsx"
 import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
+import { useArgs } from "../../context/args"
 import { useExit } from "../../context/exit"
 import { Toast, useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv.tsx"
@@ -401,6 +402,7 @@ export function Session() {
   })
 
   const exit = useExit()
+  const args = useArgs()
 
   useBindings(() => ({
     commands: [
@@ -409,7 +411,9 @@ export function Session() {
         name: "session.dashboard",
         title: "Agent dashboard",
         category: "Session",
+        enabled: !args.standalone,
         run() {
+          if (args.standalone) return
           const sid = boundSessionID ?? route.sessionID
           if (prompt) {
             const info = prompt.current

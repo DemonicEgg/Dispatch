@@ -105,6 +105,10 @@ export const TuiThreadCommand = cmd({
         type: "string",
         describe: "agent to use",
       })
+      .option("standalone", {
+        type: "boolean",
+        describe: "start a new session directly, skipping the agent dashboard",
+      })
       .option("auto", {
         type: "boolean",
         describe: "auto-approve permissions that are not explicitly denied (dangerous!)",
@@ -292,6 +296,7 @@ export const TuiThreadCommand = cmd({
               prompt,
               fork: args.fork,
               auto: args.auto || args.yolo || args["dangerously-skip-permissions"],
+              standalone: args.standalone,
             },
           }),
         )

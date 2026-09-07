@@ -291,7 +291,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                 <ToastProvider>
                                   <RouteProvider
                                     initialRoute={
-                                      input.args.continue
+                                      input.args.continue || input.args.standalone
                                         ? {
                                             type: "session",
                                             sessionID: "dummy",
@@ -526,6 +526,18 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         route.navigate({ type: "session", sessionID: match })
       }
     }
+  })
+
+  // Handle --standalone: create a new session and navigate to it
+  let standaloneCreated = false
+  createEffect(() => {
+    if (standaloneCreated || sync.status === "loading" || !args.standalone) return
+    standaloneCreated = true
+    void sdk.client.session.create({ directory: sync.path.directory }).then((result) => {
+      if (result.data?.id) {
+        route.navigate({ type: "session", sessionID: result.data.id })
+      }
+    })
   })
 
   // Handle --session with --fork: wait for sync to be fully complete before forking

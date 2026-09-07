@@ -1688,9 +1688,11 @@ export function Prompt(props: PromptProps) {
               </Show>
               <Switch>
                 <Match when={store.mode === "normal"}>
-                  <text fg={theme.text}>
-                    {dashboardShortcut()} <span style={{ fg: theme.textMuted }}>dashboard</span>
-                  </text>
+                  <Show when={!args.standalone}>
+                    <text fg={theme.text}>
+                      {dashboardShortcut()} <span style={{ fg: theme.textMuted }}>dashboard</span>
+                    </text>
+                  </Show>
                   <Switch>
                     <Match when={usage()}>
                       {(item) => (
