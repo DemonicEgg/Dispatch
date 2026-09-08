@@ -1379,14 +1379,11 @@ const layer = Layer.effect(
               ),
             )
 
-            // Outbound-only mirror to claude.ai/code so the session is
-            // viewable from the Claude app. Best-effort: attachMirror returns
-            // undefined on any failure rather than throwing.
-            // Attaching is the palette command's job; a turn only streams to an
-            // attachment that already exists.
-            const bridge = getMirror(sessionID)
             // The SDK stream carries no echo of the prompt, so mirror it here.
-            bridge?.user(lastUser.id)
+            // Attaching is the palette command's job; the processor re-resolves
+            // the mirror per message, so one started mid-turn picks the turn up
+            // from wherever it is.
+            getMirror(sessionID)?.user(lastUser.id)
 
             const result = yield* Effect.promise(() =>
               Instance.restore(ctx, () =>
@@ -1397,7 +1394,6 @@ const layer = Layer.effect(
                   cwd: ctx.directory,
                   compaction: compactRef,
                   setStatus: (sid, s) => run.fork(status.set(sid, s as any)),
-                  bridge,
                 }),
               ),
             ).pipe(Effect.onInterrupt(() => Effect.sync(() => abortController.abort())))

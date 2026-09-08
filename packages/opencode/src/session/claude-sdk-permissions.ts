@@ -389,6 +389,8 @@ function writeRemoteQuestion(mirror: MirrorHandle, questions: Question.Info[], a
   ].join("\n")
   mirror.write({
     type: "assistant",
+    // The SDK only echo-suppresses writes carrying a uuid; see writeUserMessage.
+    uuid: crypto.randomUUID(),
     parent_tool_use_id: null,
     session_id: "",
     message: {

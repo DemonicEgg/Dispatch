@@ -30,7 +30,10 @@
  *
  * Attaching is always explicit — the "Start remote session" palette command.
  * Turns consult getMirror() and stream to an attachment only if one exists, so
- * nothing is ever mirrored without the user asking for it.
+ * nothing is ever mirrored without the user asking for it. That lookup happens
+ * per message rather than once per turn, because a step is one whole SDK query
+ * that can run for minutes: snapshotting it meant a mirror started mid-turn saw
+ * nothing until the turn ended.
  */
 
 import type { BridgeSessionHandle, SessionState } from "@anthropic-ai/claude-agent-sdk/bridge"
@@ -109,20 +112,51 @@ async function readCredentials(): Promise<Credentials | undefined> {
  */
 const mapPath = () => path.join(Global.Path.state, "bridge-sessions.json")
 
-async function readMap(): Promise<Record<string, string>> {
+/** `mark` is the newest message already written to the remote transcript. */
+type BridgeEntry = { codeSessionID: string; mark?: MessageID }
+
+async function readMap(): Promise<Record<string, BridgeEntry>> {
   const data = await Filesystem.readJson(mapPath()).catch(() => undefined)
   if (!data || typeof data !== "object" || Array.isArray(data)) return {}
-  return data as Record<string, string>
+  return Object.fromEntries(
+    Object.entries(data as Record<string, unknown>).flatMap(([sessionID, value]) => {
+      // A bare string is the pre-mark format: mapped, but nothing known mirrored.
+      if (typeof value === "string") return [[sessionID, { codeSessionID: value }] as const]
+      if (!value || typeof value !== "object") return []
+      const entry = value as { codeSessionID?: unknown; mark?: unknown }
+      if (typeof entry.codeSessionID !== "string") return []
+      return [
+        [
+          sessionID,
+          {
+            codeSessionID: entry.codeSessionID,
+            ...(typeof entry.mark === "string" ? { mark: entry.mark as MessageID } : {}),
+          },
+        ] as const,
+      ]
+    }),
+  )
 }
 
-async function rememberCodeSession(sessionID: string, codeSessionID: string): Promise<void> {
-  await Filesystem.writeJson(mapPath(), { ...(await readMap()), [sessionID]: codeSessionID })
-}
+/**
+ * Serialized: the mark persists from every turn boundary of every mirrored
+ * session, and two concurrent read-modify-writes of the whole map would drop
+ * the other session's entry.
+ */
+let writes = Promise.resolve()
 
-async function forgetCodeSession(sessionID: string): Promise<void> {
-  const map = await readMap()
-  delete map[sessionID]
-  await Filesystem.writeJson(mapPath(), map)
+function writeEntry(sessionID: string, entry: BridgeEntry | undefined): Promise<void> {
+  writes = writes
+    .then(async () => {
+      const map = await readMap()
+      if (!entry) delete map[sessionID]
+      if (entry) map[sessionID] = entry
+      await Filesystem.writeJson(mapPath(), map)
+    })
+    .catch((err) => {
+      log.error("writeEntry: failed", { sessionID, error: err instanceof Error ? err.message : String(err) })
+    })
+  return writes
 }
 
 export interface MirrorHandle {
@@ -133,11 +167,18 @@ export interface MirrorHandle {
   /**
    * Mirror a locally-sent prompt. The SDK stream never echoes the user's own
    * message, so without this the remote transcript is assistant-only. Deduped
-   * by messageID, since the run loop calls this once per step.
+   * by messageID, since the run loop calls this once per step, and against the
+   * backfill high-water mark, since a mirror attached mid-turn has already
+   * replayed the in-flight prompt.
    */
   user(messageID: MessageID): void
-  /** Turn boundary — stops the "working" spinner on claude.ai. */
-  result(): void
+  /**
+   * Turn boundary — stops the "working" spinner on claude.ai. Pass the assistant
+   * message the turn just completed to record the transcript as mirrored through
+   * it, so a later attach does not backfill it again. Omit it on an abort or an
+   * error, where the message was only partially mirrored.
+   */
+  result(messageID?: MessageID): void
   state(state: SessionState): void
   /**
    * Offer a permission prompt to claude.ai and resolve with the answer given
@@ -214,7 +255,7 @@ export function mirroredSessions(): string[] {
 export async function detachMirror(sessionID: SessionID, options?: { forget?: boolean }): Promise<boolean> {
   // Forgetting is for a session that no longer exists. Stopping normally keeps
   // the mapping so starting again resumes the same remote conversation.
-  if (options?.forget) await forgetCodeSession(sessionID)
+  if (options?.forget) await writeEntry(sessionID, undefined)
   const mirror = attached.get(sessionID)
   if (!mirror) return false
   await mirror.close()
@@ -232,6 +273,10 @@ async function writeUserMessage(sessionID: SessionID, messageID: MessageID, mirr
   if (!text) return
   mirror.write({
     type: "user",
+    // The SDK's write() only echo-suppresses messages carrying a uuid: it keys
+    // its inbound-echo set off exactly the uuids it saw go out. Without one,
+    // the server's isReplay flag is all that stops a feedback loop.
+    uuid: crypto.randomUUID(),
     parent_tool_use_id: null,
     session_id: "",
     message: { role: "user", content: [{ type: "text", text }] },
@@ -240,17 +285,37 @@ async function writeUserMessage(sessionID: SessionID, messageID: MessageID, mirr
 }
 
 /**
- * Replays the session's existing messages so the remote transcript opens with
- * the conversation so far rather than empty. Text only: tool calls are reduced
- * to a one-line note, since a faithful tool_use/tool_result replay would have
- * to reconstruct block ids the SDK never gave us.
+ * Replays the messages after `from` so the remote transcript opens with the
+ * conversation so far rather than empty, and a re-attach adds only the work
+ * done while detached instead of a second copy of everything. Text only: tool
+ * calls are reduced to a one-line note, since a faithful tool_use/tool_result
+ * replay would have to reconstruct block ids the SDK never gave us.
+ *
+ * Returns the newest message replayed, for the caller to persist as the new
+ * high-water mark.
  */
-async function backfill(sessionID: SessionID, mirror: MirrorHandle, model?: string): Promise<void> {
+async function backfill(
+  sessionID: SessionID,
+  mirror: MirrorHandle,
+  from: MessageID | undefined,
+  model?: string,
+): Promise<MessageID | undefined> {
   const { MessageV2 } = await import("./message-v2")
   const history = await AppRuntime.runPromise(MessageV2.stream(sessionID)).catch(() => [])
   let written = 0
+  let mark = from
   // stream() returns newest-first, and the remote transcript is append-only.
   for (const msg of history.toReversed()) {
+    // Message ids are ascending and fixed-width, so this compares as it sorts.
+    if (from && msg.info.id <= from) continue
+    // The live stream owns a message the model is still producing: a snapshot
+    // taken here would duplicate or reorder whatever arrives next. Its head is
+    // lost to the remote transcript, which is the price of attaching mid-turn.
+    if (msg.info.role === "assistant" && !msg.info.time.completed) continue
+    // Set before the empty-body guard below: a message with nothing to render
+    // is still fully represented, and leaving it uncovered would re-examine it
+    // on every future attach.
+    mark = msg.info.id
     const text = msg.parts
       .filter((p): p is typeof p & { type: "text"; text: string } => p.type === "text" && p.text.trim() !== "")
       .map((p) => p.text)
@@ -262,12 +327,19 @@ async function backfill(sessionID: SessionID, mirror: MirrorHandle, model?: stri
       (msg.info.role === "user"
         ? {
             type: "user",
+            // See the note in writeUserMessage on why the uuid matters, and
+            // historical so claude.ai renders these as replayed history rather
+            // than a burst of new activity.
+            uuid: crypto.randomUUID(),
+            historical: true,
             parent_tool_use_id: null,
             session_id: "",
             message: { role: "user", content: [{ type: "text", text: body }] },
           }
         : {
             type: "assistant",
+            uuid: crypto.randomUUID(),
+            historical: true,
             parent_tool_use_id: null,
             session_id: "",
             message: {
@@ -284,7 +356,8 @@ async function backfill(sessionID: SessionID, mirror: MirrorHandle, model?: stri
     )
     written++
   }
-  log.info("attachMirror: backfilled transcript", { sessionID, messages: written })
+  log.info("attachMirror: backfilled transcript", { sessionID, messages: written, from, mark })
+  return mark
 }
 
 /**
@@ -305,7 +378,7 @@ export async function attachMirror(input: AttachMirrorInput): Promise<MirrorHand
 
   const existing = (await readMap())[input.sessionID]
   const codeSessionID = await (async () => {
-    if (existing) return existing
+    if (existing) return existing.codeSessionID
     const created = await createCodeSession(
       BASE_URL,
       token,
@@ -325,7 +398,7 @@ export async function attachMirror(input: AttachMirrorInput): Promise<MirrorHand
       })
       return undefined
     }
-    await rememberCodeSession(input.sessionID, created)
+    await writeEntry(input.sessionID, { codeSessionID: created })
     return created
   })()
   if (!codeSessionID) return undefined
@@ -338,7 +411,7 @@ export async function attachMirror(input: AttachMirrorInput): Promise<MirrorHand
     // mapping is still good: dropping it there would orphan the remote session
     // the phone is attached to, leaving it unreachable until a manual
     // re-attach. Keep it and let the next attempt retry the same session.
-    if (existing && creds !== null) await forgetCodeSession(input.sessionID)
+    if (existing && creds !== null) await writeEntry(input.sessionID, undefined)
     log.error("attachMirror: fetchRemoteCredentials failed", {
       codeSessionID,
       detail: creds === null ? "transient" : JSON.stringify(creds),
@@ -447,6 +520,9 @@ export async function attachMirror(input: AttachMirrorInput): Promise<MirrorHand
 
   // The run loop calls user() once per step; only the first write is real.
   let lastUserWritten: string | undefined
+  // How far the remote transcript is known to be mirrored. Advances at turn
+  // boundaries so a re-attach replays only the work done while detached.
+  let mark = existing?.mark
 
   const mirror: MirrorHandle = {
     codeSessionID,
@@ -456,9 +532,17 @@ export async function attachMirror(input: AttachMirrorInput): Promise<MirrorHand
       lastUserWritten = messageID
       // Came from claude.ai; echoing it back would duplicate it there.
       if (remoteOrigin.delete(messageID)) return
+      // Backfill already wrote it: a mirror started mid-turn sees the in-flight
+      // step call user() again on its next step.
+      if (mark && messageID <= mark) return
       void writeUserMessage(input.sessionID, messageID, mirror)
     },
-    result: () => safe("sendResult", () => handle.sendResult()),
+    result: (messageID) => {
+      safe("sendResult", () => handle.sendResult())
+      if (!messageID || (mark && messageID <= mark)) return
+      mark = messageID
+      void writeEntry(input.sessionID, { codeSessionID, mark: messageID })
+    },
     state: (state) => safe("reportState", () => handle.reportState(state)),
     askPermission: (req) =>
       new Promise((resolve) => {
@@ -479,17 +563,20 @@ export async function attachMirror(input: AttachMirrorInput): Promise<MirrorHand
       safe("close", () => handle.close())
     },
   }
-  attached.set(input.sessionID, mirror)
 
-  await backfill(input.sessionID, mirror, input.model)
+  const backfilled = await backfill(input.sessionID, mirror, mark, input.model)
   // write() only enqueues, and the uploader batches (100 per batch) on a
   // timer, so without draining here the tail of the transcript sits in the
   // queue and the remote UI shows a conversation that stops partway.
   await mirror.flush()
   // Without a result the remote UI sits on a "working" spinner for a session
   // that is in fact idle and waiting for input.
-  mirror.result()
+  mirror.result(backfilled)
   mirror.state("idle")
+  // Published last: a turn already running resolves the mirror per message, so
+  // registering before the idle above would let that turn report "running" and
+  // then be overwritten with "idle" mid-turn.
+  attached.set(input.sessionID, mirror)
 
   return mirror
 }

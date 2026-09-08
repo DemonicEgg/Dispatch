@@ -25,7 +25,7 @@ import {
   type ReasoningTime,
 } from "./claude-sdk-adapter"
 import { setSdkSessionID } from "./claude-sdk-session-map"
-import type { MirrorHandle } from "./claude-sdk-bridge"
+import { getMirror, type MirrorHandle } from "./claude-sdk-bridge"
 import { SessionCompaction } from "./compaction"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { AppRuntime } from "@/effect/app-runtime"
@@ -145,12 +145,6 @@ export interface ClaudeSdkProcessorInput {
   cwd: string
   compaction?: CompactionRef
   setStatus?: (sessionID: SessionID, status: { type: string; activity?: string }) => void
-  /**
-   * Outbound-only claude.ai mirror. Every SDKMessage is teed to it so the
-   * session is viewable from claude.ai/code and the Claude mobile app. Absent
-   * unless OPENCODE_REMOTE_CONTROL=1.
-   */
-  bridge?: MirrorHandle
 }
 
 export interface ClaudeSdkProcessorResult {
@@ -206,14 +200,25 @@ export async function processClaudeSdkStream(
   // never attributed to reasoning.
   let stepStart = Date.now()
 
-  input.bridge?.state("running")
+  // Resolved per message rather than captured once: the claude.ai mirror can be
+  // started mid-turn, and a step is one whole SDK query that can run for
+  // minutes. Held by handle identity so a detach and re-attach mid-turn reports
+  // "running" again on the new handle.
+  let running: MirrorHandle | undefined
 
   try {
     for await (const msg of messages) {
       if (input.abort.aborted) break
       const arrivedAt = Date.now()
 
-      input.bridge?.write(msg)
+      // One lookup per iteration, so write/result/state below cannot straddle a
+      // detach and act on two different handles.
+      const mirror = getMirror(sessionID)
+      if (mirror && running !== mirror) {
+        running = mirror
+        mirror.state("running")
+      }
+      mirror?.write(msg)
 
       switch (msg.type) {
         case "assistant": {
@@ -249,8 +254,8 @@ export async function processClaudeSdkStream(
           await finalizeRunningTools(assistantMessage.id)
           completionMeta = processResultMessage(msg as SDKResultMessage, assistantMessage, lastTurnUsage)
           await AppRuntime.runPromise(Session.Service.use((svc) => svc.updateMessage(assistantMessage)))
-          input.bridge?.result()
-          input.bridge?.state("idle")
+          mirror?.result(assistantMessage.id)
+          mirror?.state("idle")
           break
 
         case "system": {
@@ -305,8 +310,10 @@ export async function processClaudeSdkStream(
         data: { message: msg, isRetryable: true },
       } as SessionV1.Assistant["error"]
       await AppRuntime.runPromise(Session.Service.use((svc) => svc.updateMessage(assistantMessage)))
+      endMirroredTurn(sessionID)
       return { outcome: "error" }
     }
+    // An abort leaves completionMeta unset, so the branch below ends the turn.
   }
 
   // If we exited without a result message (e.g. abort), mark pending tools as errors
@@ -322,6 +329,7 @@ export async function processClaudeSdkStream(
       data: { message: "Stream ended without result" },
     } as SessionV1.Assistant["error"]
     await AppRuntime.runPromise(Session.Service.use((svc) => svc.updateMessage(assistantMessage)))
+    endMirroredTurn(sessionID)
     return { outcome: "error" }
   }
 
@@ -329,6 +337,19 @@ export async function processClaudeSdkStream(
     outcome: completionMeta.success ? "stop" : "error",
     metadata: completionMeta,
   }
+}
+
+/**
+ * Ends the turn on the claude.ai mirror for the paths that never see a result
+ * message — an abort or an API error. Without this the remote UI keeps spinning
+ * on a session that has in fact stopped. No message id: the assistant message
+ * was only partially mirrored, so it stays eligible for a later backfill.
+ */
+function endMirroredTurn(sessionID: SessionID): void {
+  const mirror = getMirror(sessionID)
+  if (!mirror) return
+  mirror.result()
+  mirror.state("idle")
 }
 
 /**
