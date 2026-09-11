@@ -754,11 +754,14 @@ const layer = Layer.effect(
 
     const connect = Effect.fn("MCP.connect")(function* (name: string) {
       const mcp = yield* requireMcpConfig(name)
-      yield* createAndStore(name, { ...mcp, enabled: true })
+      const override = { ...mcp, enabled: true }
+      s.config[name] = override
+      yield* createAndStore(name, override)
     })
 
     const disconnect = Effect.fn("MCP.disconnect")(function* (name: string) {
-      yield* requireMcpConfig(name)
+      const mcp = yield* requireMcpConfig(name)
+      s.config[name] = { ...mcp, enabled: false }
       yield* closeClient(s, name)
       delete s.clients[name]
       s.status[name] = { status: "disabled" }
