@@ -21,7 +21,7 @@ import { DialogSessionDeleteFailed } from "./dialog-session-delete-failed"
 import { useCommandShortcut } from "../keymap"
 import { useEvent } from "../context/event"
 
-type SessionListFilter = { scope?: "project"; path?: string }
+type SessionListFilter = { scope?: "project"; path?: string; directory?: string }
 
 export function createDialogSessionListQuery(input: { search?: string; filter: SessionListFilter }) {
   const search = input.search?.trim()
@@ -62,12 +62,28 @@ export function DialogSessionList() {
   const quickSwitch1 = useCommandShortcut("session.quick_switch.1")
   const quickSwitch9 = useCommandShortcut("session.quick_switch.9")
 
+  const currentSessionID = createMemo(() => (route.data.type === "session" ? route.data.sessionID : undefined))
+  // Follow the agent being viewed (or highlighted on the dashboard) into its own
+  // directory, since its sessions belong to that directory's project rather than
+  // the one the TUI was launched in. The store often has not seen those sessions,
+  // so fall back to the directory recorded on the dashboard agent entry.
+  const contextDirectory = createMemo(() => {
+    const id = currentSessionID() ?? sync.data.home_selected_session
+    if (!id) return undefined
+    const agents: AgentEntry[] = kv.get("agents", [])
+    const agent = agents.find((entry) => entry.sessionID === id)
+    const directory = sync.session.get(id)?.directory ?? agent?.worktree?.directory ?? agent?.directory
+    if (!directory) return undefined
+    const normalized = directory.replace(/\/+$/, "")
+    return normalized === sync.path.directory?.replace(/\/+$/, "") ? undefined : normalized
+  })
+
   const [browseResults, { refetch: refetchBrowse }] = createResource(
-    () => sync.session.query(),
+    () => sync.session.query(contextDirectory()),
     (filter) => loadDialogSessionList({ filter, list: (query) => sdk.client.session.list(query) }),
   )
   const [searchResults, { refetch }] = createResource(
-    () => ({ query: search(), filter: sync.session.query() }),
+    () => ({ query: search(), filter: sync.session.query(contextDirectory()) }),
     (input) => {
       if (!input.query) return undefined
       return loadDialogSessionList({
@@ -77,8 +93,6 @@ export function DialogSessionList() {
       })
     },
   )
-
-  const currentSessionID = createMemo(() => (route.data.type === "session" ? route.data.sessionID : undefined))
   const sessions = createMemo(() => {
     const result = searchResults() ?? browseResults() ?? sync.data.session
     const synced = new Map(sync.data.session.map((session) => [session.id, session]))

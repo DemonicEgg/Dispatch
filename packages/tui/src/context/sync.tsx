@@ -174,8 +174,19 @@ export const {
       hydratingSessions.get(sessionID)?.parts.add(partID)
     }
 
-    function sessionListQuery(): { scope?: "project"; path?: string } {
-      if (!kv.get("session_directory_filter_enabled", true)) return { scope: "project" }
+    // An explicit directory routes the request to that directory's instance, so the
+    // list comes back scoped to its project. Sessions created for a dashboard agent
+    // live in the agent's own project, which the TUI's own project never contains.
+    function sessionListQuery(overrideDirectory?: string): {
+      scope?: "project"
+      path?: string
+      directory?: string
+    } {
+      const filtered = kv.get("session_directory_filter_enabled", true)
+      if (overrideDirectory) {
+        return filtered ? { directory: overrideDirectory } : { directory: overrideDirectory, scope: "project" }
+      }
+      if (!filtered) return { scope: "project" }
       if (!project.data.instance.path.worktree || !project.data.instance.path.directory) return { scope: "project" }
       return {
         path: path
@@ -591,8 +602,8 @@ export const {
           if (match.found) return store.session[match.index]
           return undefined
         },
-        query() {
-          return sessionListQuery()
+        query(overrideDirectory?: string) {
+          return sessionListQuery(overrideDirectory)
         },
         async refresh() {
           const list = await listSessions()
